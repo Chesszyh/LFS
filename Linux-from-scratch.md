@@ -231,7 +231,7 @@ make
 make install
 ```
 
-编译GCC的过程：![alt text](编译gcc.png)
+编译GCC的过程：![alt text](./img/编译gcc.png)
 
 !!!NOTE 第一次编译时，我遗漏了以下命令，导致在Ch6 `bash`和`coreutils`编译时开始出现错误：
 
@@ -403,25 +403,79 @@ sed -e 's/^#if.*XOPEN.*$/#if 1/' \
 -i $LFS/usr/include/curses.h    # 修改curses.h，确保Ncurses总是选择与我们的libncursesw.so兼容的宽字符版本，而不是与libncurses.so兼容的8位字符版本
 ```
 
-### bash
+### bash-5.3.1-rc1(TODO)
 
 ```shell
 # You're now in bash's directory
 
 # --without-bash-malloc: 禁用bash的内存分配功能，防止段错误
-./configure --prefix=/usr \
+./configure --prefix=/usr                      \
             --build=$(sh support/config.guess) \
-            --host=$LFS_TGT \
+            --host=$LFS_TGT                    \
             --without-bash-malloc
 
-make | tee make.log
-# !!!NOTE 
-# 此处使用-j8时，有部分Warning：
-# make[1]: warning: -j8 forced in submake: resetting jobserver mode.
-# 取消-j8后，编译依然存在大量Warning和部分Error，但make.log里没有显示Error
+make # 我在这步遇到了接二连三的问题，解决之后仍然有疑点
+```
 
+我在这步遇到了报错，输出如下：
+
+```shell
+mkbuiltins.c:267:29: error: too many arguments to function 'xmalloc'; expected 0, have 1
+  267 |           error_directory = xmalloc (2 + strlen (argv[arg_index]));
+      |                             ^~~~~~~  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+mkbuiltins.c:62:14: note: declared here
+   62 | static char *xmalloc (), *xrealloc ();
+      |              ^~~~~~~
+```
+
+在 `mkbuiltins.c` 文件中，许多函数（如 `xmalloc`, `file_error` 等）使用了旧式的 C 语言函数声明，例如 `static char *xmalloc ()`。我使用的Arch Linux因为滚动更新，`gcc`版本较新(15.1.1)，看到老式声明时认为函数应接受0个参数。所以当 `xmalloc` 被带参调用时抛出一堆报错。
+
+我没有在LFS-12.3官方的补丁包里看到`bash-5.2.37`的补丁，但在`12.1`找到了一个`5.2.21`的补丁(检查发现与本问题无关)。一个2025年5月的[Reddit帖子](https://www.reddit.com/r/linuxfromscratch/comments/1kfc6jn/bash_failing_compile_in_multilib_123/)也有人遇到同样问题，有评论者提到将 Arch Linux 上的 GCC 从 15.x 降级到 14.2，或者使用`bash-5.3-rc1`版本可以解决。或者，你也可以根据海量报错信息，手动修改 `mkbuiltins.c` 中的函数声明，但我懒得弄了。
+
+我选择使用最新版`bash-5.3-rc1`(可通过`curl -O https://ftp.gnu.org/gnu/bash/bash-5.3-rc1.tar.gz`下载)和与之前相同的配置，但直接编译依然报错如下：
+
+```shell
+In file included from mkbuiltins.c:50:
+../bashansi.h:44:23: error: 'bool' cannot be defined via 'typedef'
+44 | typedef unsigned char bool;
+| ^~~~
+../bashansi.h:44:23: note: 'bool' is a keyword with '-std=c23' onwards
+../bashansi.h:44:1: warning: useless type name in empty declaration
+44 | typedef unsigned char bool;
+```
+
+检查`bashansi.h`，发现有一段检查`bool`类型的代码：
+
+```h
+/* If bool is not a compiler builtin, prefer stdbool.h if we have it */
+
+#if !defined (HAVE_C_BOOL)
+#  if defined (HAVE_STDBOOL_H)
+#    include <stdbool.h>
+#  else
+#    undef bool
+typedef unsigned char bool;     // 注意，这句也包含在`#else`分支中
+#    define true 1
+#    define false 0
+#  endif
+```
+
+含义很简单：如果没有定义`HAVE_C_BOOL`，即编译器不支持`_Bool`类型，则通过`HAVE_STDBOOL_H`检查`stdbool.h`头文件是否可用，可用则包含，否则先`undef`掉`bool`(防止与之前可能的定义冲突)，再手动定义`bool`类型(`typedef unsigned char bool` + `define`)：`true`为`1`，`false`为`0`。
+
+但是，注意`typedef unsigned char bool;`这一行。根据上面的报错，`error: 'bool' cannot be defined via 'typedef'`，如果能成功`#include <stdbool.h>`，则不会重定义`bool`；能报这个错，只可能说明预处理器分支走向了`else`分支，即`HAVE_STDBOOL_H`为`0`。但是我检查`./config.h`，发现确实有`#define HAVE_STDBOOL_H 1`。这真是见鬼了……
+
+暂时搞不清楚了，目前的解决方法是：
+
+1. 完全注释掉`bashansi.h`整段`bool`判断逻辑
+2. 在`mkbuiltins.c`第一行显式添加声明`#include <stdbool.h>`
+
+然后就编译成功了。
+
+```shell
+# Continue with the rest of the bash build
 make DESTDIR=$LFS install
 
+# rm -v $LFS/usr/bin/sh # 如果有，删除原有的sh链接
 ln -sv bash $LFS/usr/bin/sh
 ```
 
@@ -742,11 +796,285 @@ ln -sv gcc $LFS/usr/bin/cc
 
 TODO 实践到现在，是时候回顾一下交叉编译的概念了！
 
-![alt text](Ch6-over.png)
+![alt text](./img/Ch6-over.png)
 
 ## Ch7 Entering Chroot and Building Additional Temporary Tools
 
 目前已经解决了交叉编译的循环依赖问题，接下来将进入完全隔离与宿主操作系统的`chroot`环境，构建各类软件包工具。
 
 大概看了一下，应该还有很长一段路要走，现在估计也就刚到30%吧。
+
+**第7章所有命令均需要以`root`用户身份执行。**
+
+首先，将`$LFS`所有权转移到`root`用户。因为当前`lfs`用户仅存在于宿主系统中，`$LFS`下文件由一个没有对应账户的用户ID拥有。如果后续创建的账户获得了相同的ID，则会意外拥有`$LFS`下的所有文件的所有权。
+
+```shell
+# mkdir $LFS/tools # 选做，我这里发现没有这个文件夹
+ chown --from lfs -R root:root $LFS/{usr,lib,var,etc,bin,sbin,tools}
+ case $(uname -m) in
+  x86_64) chown --from lfs -R root:root $LFS/lib64 ;;
+ esac
+```
+
+准备虚拟内核文件系统。用户态应用通过**虚拟文件系统**和内核通信，该系统完全运行在内存中，因此在`chroot`下想要访问，就必须挂载到`$LFS`目录下。
+
+```shell
+ mkdir -pv $LFS/{dev,proc,sys,run}
+# 准备/dev目录
+mount -v --bind /dev $LFS/dev   # 绑定挂载
+```
+
+此处**绑定挂载**指的是让`$LFS/dev`成为`/dev`的别名，二者是同一目录的不同入口。**绑定挂载**与**普通挂载**的区别在于，普通挂载是将一个新的文件系统(如U盘`sdb1`、新硬盘分区`sda1`)挂载到另一个文件系统上，而绑定挂载则是将一个已存在的目录(如`/dev`)挂载到另一个目录(如`$LFS/dev`)上。
+
+接下来挂载剩余的虚拟文件系统：
+
+```shell
+mount -vt devpts devpts -o gid=5,mode=0620 $LFS/dev/pts
+mount -vt proc proc $LFS/proc
+mount -vt sysfs sysfs $LFS/sys
+mount -vt tmpfs tmpfs $LFS/run
+
+# 确保/dev/shm能在`chroot`环境中使用
+ if [ -h $LFS/dev/shm ]; then
+  install -v -d -m 1777 $LFS$(realpath /dev/shm)
+ else
+  mount -vt tmpfs -o nosuid,nodev tmpfs $LFS/dev/shm
+ fi
+```
+
+你可能会有疑问(或者我有，因为我菜)：为什么只有`/dev`目录需要绑定挂载，而其他目录都直接挂载？
+
+这是因为，我们需要用宿主机提供的硬件设备服务(`/dev`)来创建一个新的文件系统实例(`/proc`等)。`/dev`包含了所有与**硬件**通信所需的设备文件，由宿主机内核动态创建和管理。绑定挂载能够让`chroot`模拟在宿主机上运行的环境。而其他目录如`/proc`，我们需要的不是共享宿主机的现有目录，所以需要创建新的虚拟文件系统实例。
+
+接下来，以root身份进入`chroot`环境：
+
+```shell
+ chroot "$LFS" /usr/bin/env -i   \
+    HOME=/root                  \
+    TERM="$TERM"                \
+    PS1='(lfs chroot) \u:\w\$ ' \
+    PATH=/usr/bin:/usr/sbin     \
+    MAKEFLAGS="-j$(nproc)"      \
+    TESTSUITEFLAGS="-j$(nproc)" \
+    /bin/bash --login
+```
+
+到此，不再需要使用`$LFS`变量，所有操作都在`chroot`环境中进行。并且`/tools/bin`也不在`$PATH`中，意味着交叉工具链将不再被使用。如果意外退出了`chroot`环境，我们必须重新挂载虚拟文件系统，再重新进入`chroot`。
+
+> 执行之后bash显示：`(lfs chroot) I have no name!:/# `(因为`/etc/passwd`尚未创建)，这句感觉有点莫名可爱呢
+
+继续创建目录结构、必要文件和符号链接：
+
+```shell
+# 创建目录结构
+mkdir -pv /{boot,home,mnt,opt,srv}
+mkdir -pv /etc/{opt,sysconfig}
+mkdir -pv /lib/firmware
+mkdir -pv /media/{floppy,cdrom}
+mkdir -pv /usr/{,local/}{include,src}
+mkdir -pv /usr/lib/locale
+mkdir -pv /usr/local/{bin,lib,sbin}
+mkdir -pv /usr/{,local/}share/{color,dict,doc,info,locale,man}
+mkdir -pv /usr/{,local/}share/{misc,terminfo,zoneinfo}
+mkdir -pv /usr/{,local/}share/man/man{1..8}
+mkdir -pv /var/{cache,local,log,mail,opt,spool}
+mkdir -pv /var/lib/{color,misc,locate}
+ln -sfv /run /var/run
+ln -sfv /run/lock /var/lock
+install -dv -m 0750 /root
+install -dv -m 1777 /tmp /var/tmp
+
+# 创建符号链接、必要文件
+ln -sv /proc/self/mounts /etc/mtab
+cat > /etc/hosts << EOF
+127.0.0.1  localhost $(hostname)
+::1        localhost
+EOF
+
+# 创建`/etc/passwd`文件，确保root用户可以登录并被系统识别
+cat > /etc/passwd << "EOF"
+root:x:0:0:root:/root:/bin/bash
+bin:x:1:1:bin:/dev/null:/usr/bin/false
+daemon:x:6:6:Daemon User:/dev/null:/usr/bin/false
+messagebus:x:18:18:D-Bus Message Daemon User:/run/dbus:/usr/bin/false
+uuidd:x:80:80:UUID Generation Daemon User:/dev/null:/usr/bin/false
+nobody:x:65534:65534:Unprivileged User:/dev/null:/usr/bin/false
+EOF
+
+# 创建`/etc/group`
+# Linux 标准规范仅仅建议 GID: 1->root, 2->bin, 5->tty or devpts
+# 而其他组名可以由管理员灵活设置
+# 编写良好的程序应该使用组名而不是组ID来访问组权限，如果有问题，不是管理员的锅
+
+cat > /etc/group << "EOF"
+root:x:0:
+bin:x:1:daemon
+sys:x:2:
+kmem:x:3:
+tape:x:4:
+tty:x:5:
+daemon:x:6:
+floppy:x:7:
+disk:x:8:
+lp:x:9:
+dialout:x:10:
+audio:x:11:
+video:x:12:
+utmp:x:13:
+cdrom:x:15:
+adm:x:16:
+messagebus:x:18:
+input:x:24:
+mail:x:34:
+kvm:x:61:
+uuidd:x:80:
+wheel:x:97:
+users:x:999:
+nogroup:x:65534:
+EOF
+
+# 添加Ch8需要的普通用户
+echo "tester:x:101:101::/home/tester:/bin/bash" >> /etc/passwd
+echo "tester:x:101:" >> /etc/group
+install -o tester -d /home/tester
+
+# 消除`I have no name!`的提示
+exec /usr/bin/bash --login
+
+# 初始化日志文件(如果文件不存在，程序不会自动创建)并设置适当权限
+# wtmp: 所有登录和注销记录
+# lastlog: 记录每个用户的最后登录时间
+# faillog: 记录登录失败的尝试
+# btmp: 记录不良的登录尝试
+
+touch /var/log/{btmp,lastlog,faillog,wtmp}
+chgrp -v utmp /var/log/lastlog
+chmod -v 664  /var/log/lastlog
+chmod -v 600  /var/log/btmp
+```
+
+接下来，安装其他软件包。
+
+### gettext
+
+`gettext`是一个用于国际化和本地化的工具集，允许程序编译时启动`NLS`(National Language Support)，以用户的语言显示信息。
+
+```shell
+# You're now in chroot's gettext directory
+./configure --disable-shared
+make
+cp -v gettext-tools/src/{msgfmt,msgmerge,xgettext} /usr/bin
+```
+
+### bison
+
+`bison` 是一个 GNU 的解析器生成器，用于将语法规则转换为可执行的解析器代码。
+
+```shell
+./configure --prefix=/usr \
+            --docdir=/usr/share/doc/bison-3.8.2
+```
+
+这里第一次出现配置报错：
+
+```shell
+checking for GNU M4 that supports accurate traces... configure: error: no acceptable m4 could be found in $PATH.
+GNU M4 1.4.6 or later is required; 1.4.16 or newer is recommended.
+GNU M4 1.4.15 uses a buggy replacement strstr on some systems.
+Glibc 2.9 - 2.12 and GNU M4 1.4.11 - 1.4.15 have another strstr bug.
+```
+
+在软件包的构建过程中，顺序是非常重要的。`bison` 需要 `m4` 来处理宏和预处理指令，但在构建过程中，`m4` 还没有被安装，LFS Book也没有 `m4` 的章节(BUG?)。我们先手动安装：
+
+```shell
+# You're now in m4's directory
+./configure --prefix=/usr
+make
+make install
+```
+
+再回到 `bison` 的目录，重新配置、编译安装即可。
+
+### perl
+
+`perl` 是一个强大的脚本语言，广泛用于文本处理、系统管理和网络编程。
+
+> `wget https://www.cpan.org/src/5.0/perl-5.40.2.tar.gz`(?)
+
+```shell
+sh Configure -des                                        \
+            -D prefix=/usr                               \
+            -D vendorprefix=/usr                         \
+            -D useshrplib                                \
+            -D privlib=/usr/lib/perl5/5.40/core_perl     \
+            -D archlib=/usr/lib/perl5/5.40/core_perl     \
+            -D sitelib=/usr/lib/perl5/5.40/site_perl     \
+            -D sitearch=/usr/lib/perl5/5.40/site_perl    \
+            -D vendorlib=/usr/lib/perl5/5.40/vendor_perl \
+            -D vendorarch=/usr/lib/perl5/5.40/vendor_perl
+make
+make install
+```
+
+### python
+
+当前无需安装静态库和包管理工具`pip`。
+
+> `wget https://www.python.org/ftp/python/3.13.2/Python-3.13.2.tar.xz`(?)
+
+```shell
+./configure --prefix=/usr   \
+        --enable-shared \
+        --without-ensurepip
+make
+make install
+```
+
+### texinfo
+
+`texinfo` 是一个用于创建和维护文档的工具，支持生成多种格式的文档。
+
+```shell
+./configure --prefix=/usr
+make
+make install
+```
+
+### util-linux
+
+`util-linux` 是一组实用工具的集合，提供了许多系统管理和维护功能。
+
+```shell
+mkdir -pv /var/lib/hwclock
+./configure --libdir=/usr/lib \
+        --runstatedir=/run    \
+        --disable-chfn-chsh   \
+        --disable-login       \
+        --disable-nologin     \
+        --disable-su          \
+        --disable-setpriv     \
+        --disable-runuser     \
+        --disable-pylibmount  \
+        --disable-static      \
+        --disable-liblastlog2 \
+        --without-python      \
+        ADJTIME_PATH=/var/lib/hwclock/adjtime \
+        --docdir=/usr/share/doc/util-linux-2.40.4
+make
+make install   
+```
+
+### 清理并保存临时系统
+
+```shell
+rm -rf /usr/share/{info,man,doc}/*
+find /usr/{lib,libexec} -name \*.la -delete
+rm -rf /tools
+```
+
+此处可以进行备份，直接拍快照或者按照LFS Book进行打包。
+
+# Part 4: Building the LFS System
+
+## Ch8 Installing Basic System Software
 
