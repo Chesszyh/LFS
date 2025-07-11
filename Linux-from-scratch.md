@@ -1078,3 +1078,495 @@ rm -rf /tools
 
 ## Ch8 Installing Basic System Software
 
+本章开始正式构建LFS系统。
+
+- 不建议启用额外的自定义优化选项，避免编译和运行时问题。
+- 不建议安装**静态库**，因为现代Linux系统中，大多数静态库已过时。使用`--disable-static`禁用安装。
+- 软件包管理
+    - 凭记忆管理
+    - 独立目录安装+通用包名符号链接
+        - 例如：`/opt/foo-1.1`和`/opt/foo-1.2`都存在，将`/opt/foo`链接到最新版本
+        - 需要扩展环境变量
+    - 符号链接
+        - 不使用通用包名，而是将每个文件都链接到`/usr`，这样无需扩展环境变量
+        - 可能需要在`make install`时使用`DESTDIR`指定安装路径
+    - 基于时间戳管理
+        - 简易，但可能存在日志并发控制问题(比如从两个不同的终端同时运行安装)
+    - 追踪安装脚本执行命令
+        - 如记录`cp`, `mv`, `ln`等命令的执行
+    - **创建软件包归档文件**
+        - 步骤：
+            - 临时安装(比如安装到`/tmp`)，保留原有目录结构
+            - 使用`tar`打包归档文件
+            - 将归档文件解包到`/`下，由于归档文件保留了原有目录结构，解包后就会自动放到
+              正确的位置
+        - 大多数Linux发行版使用这种方式，如`deb`/`rpm`/`portage`(gentoo)等
+        - 易于管理(卸载时只需要根据`tar`归档文件删除对应目录即可)、移植性好(编译好的包直接复制到其他系统即可安装)
+
+接下来开始安装软件包。
+
+```shell
+# man-pages
+rm -v man3/crypt*
+make -R GIT=false prefix=/usr install
+
+# iana-etc: 提供网络服务和协议的相关数据
+cp services protocols /etc
+```
+
+安装`glibc`：
+
+```shell
+# glibc: GNU C Library
+patch -Np1 -i ../glibc-2.41-fhs-1.patch
+rm -rf build
+mkdir -v build
+cd build
+echo "rootsbindir=/usr/sbin" > configparms
+../configure --prefix=/usr                           \
+            --disable-werror                         \
+            --enable-kernel=5.4                      \
+            --enable-stack-protector=strong          \
+            --disable-nscd                           \
+            libc_cv_slibdir=/usr/lib
+make  # -j8大概需要4min
+touch /etc/ld.so.conf # 避免glibc安装时一直报miss of `/etc/ld.so.conf`的warning
+
+sed '/test-installation/s@$(PERL)@echo not running@' -i ../Makefile
+
+make install
+sed '/RTLDLIST=/s@/usr@@g' -i /usr/bin/ldd
+
+# 配置区域设置：如果跳过，可能导致某些软件包跳过部分重要测试用例
+# 以下是locales的最小集合
+localedef -i C -f UTF-8 C.UTF-8
+localedef -i cs_CZ -f UTF-8 cs_CZ.UTF-8
+localedef -i de_DE -f ISO-8859-1 de_DE
+localedef -i de_DE@euro -f ISO-8859-15 de_DE@euro
+localedef -i de_DE -f UTF-8 de_DE.UTF-8
+localedef -i el_GR -f ISO-8859-7 el_GR
+localedef -i en_GB -f ISO-8859-1 en_GB
+localedef -i en_GB -f UTF-8 en_GB.UTF-8
+localedef -i en_HK -f ISO-8859-1 en_HK
+localedef -i en_PH -f ISO-8859-1 en_PH
+localedef -i en_US -f ISO-8859-1 en_US
+localedef -i en_US -f UTF-8 en_US.UTF-8
+localedef -i es_ES -f ISO-8859-15 es_ES@euro
+localedef -i es_MX -f ISO-8859-1 es_MX
+localedef -i fa_IR -f UTF-8 fa_IR
+localedef -i fr_FR -f ISO-8859-1 fr_FR
+localedef -i fr_FR@euro -f ISO-8859-15 fr_FR@euro
+localedef -i fr_FR -f UTF-8 fr_FR.UTF-8
+localedef -i is_IS -f ISO-8859-1 is_IS
+localedef -i is_IS -f UTF-8 is_IS.UTF-8
+localedef -i it_IT -f ISO-8859-1 it_IT
+localedef -i it_IT -f ISO-8859-15 it_IT@euro
+localedef -i it_IT -f UTF-8 it_IT.UTF-8
+localedef -i ja_JP -f EUC-JP ja_JP
+localedef -i ja_JP -f SHIFT_JIS ja_JP.SJIS 2> /dev/null || true
+localedef -i ja_JP -f UTF-8 ja_JP.UTF-8
+localedef -i nl_NL@euro -f ISO-8859-15 nl_NL@euro
+localedef -i ru_RU -f KOI8-R ru_RU.KOI8-R
+localedef -i ru_RU -f UTF-8 ru_RU.UTF-8
+localedef -i se_NO -f UTF-8 se_NO.UTF-8
+localedef -i ta_IN -f UTF-8 ta_IN.UTF-8
+localedef -i tr_TR -f UTF-8 tr_TR.UTF-8
+localedef -i zh_CN -f GB18030 zh_CN.GB18030
+localedef -i zh_HK -f BIG5-HKSCS zh_HK.BIG5-HKSCS
+localedef -i zh_TW -f UTF-8 zh_TW.UTF-8
+```
+
+配置`glibc`：
+
+```shell
+# 添加`nsswitch.conf`文件
+# 该文件定义了系统如何查找用户、组、主机等信息
+cat > /etc/nsswitch.conf << "EOF"
+# Begin /etc/nsswitch.conf
+passwd: files
+group: files
+shadow: files
+hosts: files dns
+networks: files
+protocols: files
+services: files
+ethers: files
+rpc: files
+# End /etc/nsswitch.conf
+EOF
+
+# 添加时区数据
+# Change to glibc/timezone directory
+ZONEINFO=/usr/share/zoneinfo
+mkdir -pv $ZONEINFO/{posix,right}
+for tz in etcetera southamerica northamerica europe africa antarctica  \
+        asia australasia backward; do
+zic -L /dev/null   -d $ZONEINFO       ${tz}
+zic -L /dev/null   -d $ZONEINFO/posix ${tz}
+zic -L leapseconds -d $ZONEINFO/right ${tz}
+done
+cp -v zone.tab zone1970.tab iso3166.tab $ZONEINFO
+zic -d $ZONEINFO -p America/New_York
+unset ZONEINFO tz
+
+# 确定本地时区
+tzselect    # 最终确定Asia/Shanghai，可通过向`~/.profile`添加`export TZ=Asia/Shanghai`来永久设置
+ln -sfv /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+
+# 配置动态加载器
+cat > /etc/ld.so.conf << "EOF"
+# Begin /etc/ld.so.conf
+/usr/local/lib
+/opt/lib
+EOF
+
+cat >> /etc/ld.so.conf << "EOF"
+# Add an include directory
+include /etc/ld.so.conf.d/*.conf
+EOF
+mkdir -pv /etc/ld.so.conf.d
+```
+
+接下来，继续安装其他软件包。
+
+```shell
+# zlib
+./configure --prefix=/usr
+make
+make install
+rm -fv /usr/lib/libz.a
+
+# bzip
+patch -Np1 -i ../bzip2-1.0.8-install_docs-1.patch
+sed -i 's@\(ln -s -f \)$(PREFIX)/bin/@\1@' Makefile
+sed -i "s@(PREFIX)/man@(PREFIX)/share/man@g" Makefile
+make -f Makefile-libbz2_so
+make clean
+make
+make PREFIX=/usr install
+
+cp -av libbz2.so.* /usr/lib
+ln -sv libbz2.so.1.0.8 /usr/lib/libbz2.so
+
+cp -v bzip2-shared /usr/bin/bzip2
+for i in /usr/bin/{bzcat,bunzip2}; do
+ln -sfv bzip2 $i
+done
+rm -fv /usr/lib/libbz2.a
+
+# xz: 比gzip/bzip2提供更好的压缩率，支持lzma/xz格式
+./configure --prefix=/usr    \
+        --disable-static \
+        --docdir=/usr/share/doc/xz-5.6.4
+make
+make install
+
+# lz4: 一个快速的无损压缩算法，可与zstandard协同工作
+make BUILD_STATIC=no PREFIX=/usr
+make BUILD_STATIC=no PREFIX=/usr install
+
+# zstd: 快速无损压缩算法
+make PREFIX=/usr
+make prefix=/usr install
+rm -v /usr/lib/libzstd.a
+
+# file
+./configure --prefix=/usr
+make
+make install
+
+# readline: 提供命令行编辑和历史功能
+sed -i '/MV.*old/d' Makefile.in
+sed -i '/{OLDSUFF}/c:' support/shlib-install
+sed -i 's/-Wl,-rpath,[^ ]*//' support/shobj-conf
+
+./configure --prefix=/usr    \
+        --disable-static \
+        --with-curses    \
+        --docdir=/usr/share/doc/readline-8.2.13
+make SHLIB_LIBS="-lncursesw"
+make install
+install -v -m644 doc/*.{ps,pdf,html,dvi} /usr/share/doc/readline-8.2.13 # 可选，安装文档
+
+# m4
+./configure --prefix=/usr
+# FIX 解决`_GL_ATTRIBUTE_NODISCARD`宏报错
+find lib -type f -name '*.c' -o -name '*.h' | xargs sed -i 's/_GL_ATTRIBUTE_NODISCARD//g'
+make
+```
+
+这里按照书走的时候遇到Error，基本都是`_GL_ATTRIBUTE_NODISCARD`宏报错。原因是`m4`的`gnulib`库版本太旧，检测和启用C语言`[[nodiscard]]`的方法与新版`gcc`不兼容。直接删除所有`_GL_ATTRIBUTE_NODISCARD`宏的定义即可。
+
+bc:
+
+```shell
+# bc: 一个任意精度的计算器语言
+CC=gcc ./configure --prefix=/usr -G -O3 -r
+# FIX 同样是编译版本问题，可能是头文件结构变化导致bc自定义的`falseUL`和`trueUL`找不到(缺失宏定义)
+sed -i '1i#define falseUL (unsigned long) 0\n#define trueUL (unsigned long) 1' src/data.c
+```
+
+继续其他软件包的安装：
+
+```shell
+# flex: 一个快速的正则表达式库
+./configure --prefix=/usr \
+        --docdir=/usr/share/doc/flex-2.6.4 \
+        --disable-static
+make
+make install
+# lex是flex的前身，因此设置兼容性链接
+ln -sv flex   /usr/bin/lex
+ln -sv flex.1 /usr/share/man/man1/lex.1
+```
+
+接下来的三个包：`tcl`, `expect`, `dejagnu`，都是为了支持运行`binutils`、`gcc`等编译器工具链的测试套件。
+
+```shell
+# tcl: 一个脚本语言，广泛用于嵌入式系统和GUI应用
+SRCDIR=$(pwd)
+cd unix
+./configure --prefix=/usr           \
+        --mandir=/usr/share/man \
+        --disable-rpath
+make
+```
+
+从配置文件中移除对构建目录的硬编码(`rpath(runtime-search-path)`)。硬编码有诸多坏处：`rpath`搜索优先级非常高，通常比系统默认路径还要高，一旦库文件移动就会找不到命令；更甚者，一旦`rpath`被攻击者劫持而指向恶意同名程序，会导致安全问题。
+
+```shell
+sed -e "s|$SRCDIR/unix|/usr/lib|" \
+-e "s|$SRCDIR|/usr/include|"  \
+-i tclConfig.sh
+
+sed -e "s|$SRCDIR/unix/pkgs/tdbc1.1.10|/usr/lib/tdbc1.1.10|" \
+-e "s|$SRCDIR/pkgs/tdbc1.1.10/generic|/usr/include|"    \
+-e "s|$SRCDIR/pkgs/tdbc1.1.10/library|/usr/lib/tcl8.6|" \
+-e "s|$SRCDIR/pkgs/tdbc1.1.10|/usr/include|"            \
+-i pkgs/tdbc1.1.10/tdbcConfig.sh
+
+sed -e "s|$SRCDIR/unix/pkgs/itcl4.3.2|/usr/lib/itcl4.3.2|" \
+-e "s|$SRCDIR/pkgs/itcl4.3.2/generic|/usr/include|"    \
+-e "s|$SRCDIR/pkgs/itcl4.3.2|/usr/include|"            \
+-i pkgs/itcl4.3.2/itclConfig.sh
+unset SRCDIR
+
+make install
+
+chmod -v u+w /usr/lib/libtcl8.6.so
+# 安装expect需要的头文件
+make install-private-headers
+ln -sfv tclsh8.6 /usr/bin/tclsh
+mv /usr/share/man/man3/{Thread,Tcl_Thread}.3
+```
+
+继续编译和安装：
+
+```shell
+# expect: 一个自动化测试和交互式脚本语言
+# 检查pty
+python3 -c 'from pty import spawn; spawn(["echo", "ok"])'
+patch -Np1 -i ../expect-5.45.4-gcc14-1.patch
+./configure --prefix=/usr       \
+        --with-tcl=/usr/lib     \
+        --enable-shared         \
+        --disable-rpath         \
+        --mandir=/usr/share/man \
+        --with-tclinclude=/usr/include
+make
+```
+
+编译前还需要打一堆补丁：
+
+1. `exp_command.h` :
+
+```c
+// Line 225-226
+// 将void (*)() 改为 void (*)(void*)。新版的gcc对此类函数指针类型有严格要求
+#define exp_deleteProc (void (*)(void*))0
+#define exp_deleteObjProc  (void (*)(void*))0
+
+// Line 324
+// EXTERN void		exp_init_tty_cmds();
+EXTERN void             exp_init_tty_cmds(struct Tcl_Interp *);
+```
+
+2. `exp_tty.c`
+
+```c
+// #include <signal.h> 后面追加：
+#include <sys/types.h>
+
+// Line 575 修改类型
+// RETSIGTYPE (*old)();	/* save old sigalarm handler */
+RETSIGTYPE (*old)(int);	/* save old sigalarm handler */
+```
+
+3. `exp_main_sub.c`
+
+```c
+// void (*exp_app_exit)() = 0;
+// void (*exp_event_exit)() = 0;
+void (*exp_app_exit)(Tcl_Interp *) = 0;
+void (*exp_event_exit)(Tcl_Interp *) = 0;
+```
+
+4. `exp_pty.c`
+
+```c
+// static RETSIGTYPE (*oldIntHandler)();
+// static RETSIGTYPE (*oldAlarmHandler)();
+static RETSIGTYPE (*oldAlarmHandler)(int);
+static RETSIGTYPE (*oldHupHandler)(int);
+```
+
+5. `exp_trap.c`
+
+这是原始代码 (K&R 风格) 与 现代代码(ANSI C 风格) 的冲突。
+
+```c
+// 1. 修改为现代的函数定义风格
+/* called by tophalf() to process the given signal */
+// static int
+// eval_trap_action(interp,sig,trap,oldcode)
+// Tcl_Interp *interp;
+// int sig;
+// struct trap *trap;
+// int oldcode;
+static int
+eval_trap_action(Tcl_Interp *interp, int sig, struct trap *trap, int oldcode)
+
+// 2. 并将eval_trap_action()0参声明改为4参
+// static int eval_trap_action();
+static int eval_trap_action(Tcl_Interp *interp, int sig, struct trap *trap, int oldcode);
+
+// 3. 继续修改老式的函数定义风格(exp_win.c/h都要改)
+int exp_window_size_set(int fd);
+int exp_window_size_get(int fd);
+```
+
+4. `exp_clib.c`
+
+```c
+// char *exp_printify();
+char *exp_printify(char*);
+```
+
+TODO 还是报错
+
+```shell
+make install
+ln -svf expect5.45.4/libexpect5.45.4.so /usr/lib
+```
+
+继续：
+
+```shell
+# DejaGNU: 一个用于测试软件的框架，支持多种编程语言和平台
+mkdir -v build
+cd       build
+
+../configure --prefix=/usr
+makeinfo --html --no-split -o doc/dejagnu.html ../doc/dejagnu.texi
+makeinfo --plaintext       -o doc/dejagnu.txt  ../doc/dejagnu.texi
+
+make check
+make install
+install -v -dm755  /usr/share/doc/dejagnu-1.6.3
+install -v -m644   doc/dejagnu.{html,txt} /usr/share/doc/dejagnu-1.6.3
+
+# pkgconf: 一个用于管理编译器和链接器的工具，提供了库和头文件的路径信息
+./configure --prefix=/usr              \
+        --disable-static           \
+        --docdir=/usr/share/doc/pkgconf-2.3.0
+make
+make install
+ln -sv pkgconf   /usr/bin/pkg-config
+ln -sv pkgconf.1 /usr/share/man/man1/pkg-config.1
+
+# binutils(2): GNU 二进制工具集
+ mkdir -v build
+ cd       build
+ ../configure --prefix=/usr       \
+             --sysconfdir=/etc   \
+             --enable-ld=default \
+             --enable-plugins    \
+             --enable-shared     \
+             --disable-werror    \
+             --enable-64-bit-bfd \
+             --enable-new-dtags  \
+             --with-system-zlib  \
+             --enable-default-hash-style=gnu
+             make tooldir=/usr
+make -k check # 必须执行！
+grep '^FAIL:' $(find -name '*.log')
+make tooldir=/usr install
+rm -rfv /usr/lib/lib{bfd,ctf,ctf-nobfd,gprofng,opcodes,sframe}.a \
+/usr/share/doc/gprofng/
+
+# gmp
+# TODO 配置报错，应该不是copilot说的问题，因为删除/tools确实是书上说的，在7.13 P109
+# wget https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz
+ABI=32 ./configure --prefix=/usr    \
+        --enable-cxx     \
+        --disable-static \
+        --docdir=/usr/share/doc/gmp-6.3.0
+
+# mpfr
+# wget https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.2.tar.xz
+ ./configure --prefix=/usr        \
+            --disable-static     \
+            --enable-thread-safe \
+            --docdir=/usr/share/doc/mpfr-4.2.2
+make
+make html
+make check
+make install
+make install-html
+
+# mpc: 一个用于任意高精度复数计算的库
+# wget https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz
+
+ ./configure --prefix=/usr    \
+            --disable-static \
+            --docdir=/usr/share/doc/mpc-1.3.1
+make
+make html
+make check
+make install
+make install-html
+
+# attr: 管理文件系统对象扩展属性的工具
+ ./configure --prefix=/usr     \
+            --disable-static  \
+            --sysconfdir=/etc \
+            --docdir=/usr/share/doc/attr-2.5.2
+make
+make install
+
+# acl: 管理访问控制列表(ACL)的工具，可定义更细粒度的文件权限
+  ./configure --prefix=/usr         \
+            --disable-static      \
+            --docdir=/usr/share/doc/acl-2.3.2
+make    
+make install       
+
+# libcap: 提供对Linux内核能力的访问控制
+sed -i '/install -m.*STA/d' libcap/Makefile
+make prefix=/usr lib=lib
+make test
+make prefix=/usr lib=lib install
+
+# libxcrypt: 提供单向哈希加密的现代密码库
+./configure --prefix=/usr                \
+            --enable-hashes=strong,glibc \
+            --enable-obsolete-api=no     \
+            --disable-static             \
+            --disable-failure-tokens
+make
+make install
+
+# shadow
+```
+
+
